@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Seinfighter</title>
+<style>
+  :root{
+    --char-height: 46vh;   /* how tall Jerry & Newman are       */
+    --hb-width: 38vw;      /* width of each health bar          */
+    --hb-top: 16px;        /* health bar distance from the top  */
+    --hb-side: 16px;       /* health bar distance from the side */
+  }
+
+  *{ box-sizing: border-box; }
+
+  html, body{
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    background: #000;
+    font-family: "Arial Black", Impact, system-ui, sans-serif;
+  }
+
+  #stage{
+    position: fixed;
+    inset: 0;
+    overflow: hidden;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
+  /* ---- Layers (low z-index = further back) ---- */
+  #background{
+    position: absolute; inset: 0;
+    width: 100%; height: 100%;
+    object-fit: cover;
+    z-index: 0;
+  }
+
+  .fighter{
+    position: absolute;
+    bottom: 0;
+    height: var(--char-height);
+    width: auto;
+    z-index: 10;
+  }
+  #jerry{ left: 0; }
+  #newman{ right: 0; }
+
+  #foreground{
+    position: absolute; inset: 0;
+    width: 100%; height: 100%;
+    object-fit: cover;
+    z-index: 20;
+    pointer-events: none;   /* never blocks clicks/keys */
+  }
+
+  /* Health bars sit on top of the foreground (they're the HUD) */
+  .healthbar{
+    position: absolute;
+    top: var(--hb-top);
+    width: var(--hb-width);
+    z-index: 30;
+  }
+  #hp-left{ left: var(--hb-side); }
+  #hp-right{ right: var(--hb-side); }
+
+  /* Make the bar (img, or the canvas libgif swaps in) fill its slot */
+  .healthbar img,
+  .healthbar .jsgif,
+  .healthbar canvas{
+    display: block;
+    width: 100%;
+    height: auto;
+  }
+  .jsgif_toolbar{ display: none !important; }  /* hide libgif's loading bar */
+
+  #win{
+    position: absolute; inset: 0;
+    z-index: 40;
+    display: none;                 /* shown on victory */
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    color: #fff;
+    font-size: 8vw;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    -webkit-text-stroke: 2px #000;
+    text-shadow: 5px 5px 0 #b00000, 0 0 18px #000;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+  <div id="stage">
+    <img id="background" src="images/Background.png" alt="">
+
+    <img id="jerry"  class="fighter" src="images/Jerry_idle.gif"  alt="Jerry">
+    <img id="newman" class="fighter" src="images/Newman_idle.gif" alt="Newman">
+
+    <img id="foreground" src="images/Foreground.png" alt="">
+
+    <div id="hp-left"  class="healthbar"><img id="health-left"  src="images/healthbar_left.gif"  alt=""></div>
+    <div id="hp-right" class="healthbar"><img id="health-right" src="images/healthbar_right.gif" alt=""></div>
+
+    <div id="win">Jerry Wins!</div>
+  </div>
+
+  <!-- libgif lets us freeze a GIF and step it one frame at a time -->
+  <script src="libgif.js"></script>
+  <script>
+  (function(){
+    "use strict";
+
+    /* ============================ TUNABLES ============================ */
+    var MOVE_SPEED     = 320;  // Jerry's walk speed, pixels per second
+    var PUNCH_DURATION = 500;  // ms Jerry is locked while a punch plays
+    var PUNCH_REACH    = 140;  // max gap (px) to Newman that still counts as a hit
+    var WIN_FRAME      = 10;   // landed-hit count that empties Newman's bar and wins
+    /* ================================================================= */
+
+    var IMG = {
+      idle:     "images/Jerry_idle.gif",
+      walk:     "images/Jerry_walk.gif",
+      walkback: "images/Jerry_Walk_back.gif",
+      punch:    "images/Jerry_punch.gif"
+    };
+
+    var jerry   = document.getElementById("jerry");
+    var newman  = document.getElementById("newman");
+    var winText = document.getElementById("win");
+
+    var keys        = { left:false, right:false };
+    var jerryX      = 0;        // Jerry's left edge, in px
+    var currentAnim = "idle";
+    var isPunching  = false;
+    var punchEndsAt = 0;
+    var gameOver    = false;
+    var lastTime    = 0;
+
+    /* ---- Jerry's looping animations: only swap the gif on a state change
+            (re-setting the same src every frame would freeze it on frame 1) ---- */
+    function setAnim(name){
+      if (name === currentAnim) return;
+      currentAnim = name;
+      jerry.src = IMG[name];
+    }
+
+    /* ---- Health bars: render each GIF to a canvas so we can choose the
+            frame shown. Left bar stays on frame 0; right bar advances. ---- */
+    var rightGif = null, rightLen = 0, rightFrame = 0;
+
+    function freezeBar(imgId, onReady){
+      var img = document.getElementById(imgId);
+      if (!window.SuperGif || !img) return null;
+      try{
+        var g = new SuperGif({ gif: img, auto_play: false, loop_mode: false });
+        g.load(function(){
+          try { g.move_to(0); } catch(e){}
+          if (onReady) onReady(g);
+        });
+        return g;
+      } catch(e){ return null; }
+    }
+
+    function initBars(){
+      freezeBar("health-left");                            // Jerry's HP: parked at frame 0
+      rightGif = freezeBar("health-right", function(g){    // Newman's HP: we advance this
+        try { rightLen = g.get_length(); } catch(e){ rightLen = 0; }
+      });
+    }
+
+    function advanceRightBar(){
+      rightFrame++;
+      if (rightGif){
+        try { rightGif.move_to(Math.min(rightFrame, Math.max(0, rightLen - 1))); } catch(e){}
+      }
+      if (rightFrame >= WIN_FRAME) win();
+    }
+
+    function win(){
+      gameOver = true;
+      setAnim("idle");
+      winText.style.display = "flex";
+    }
+
+    /* ---- Is Jerry close enough to Newman for the punch to land? ---- */
+    function punchConnects(){
+      var j = jerry.getBoundingClientRect();
+      var n = newman.getBoundingClientRect();
+      var gap = n.left - j.right;                       // space between the two sprites
+      var sameRow = j.bottom > n.top && n.bottom > j.top;
+      return sameRow && gap < PUNCH_REACH;
+    }
+
+    function startPunch(now){
+      isPunching  = true;
+      punchEndsAt = now + PUNCH_DURATION;
+      currentAnim = "punch";
+      // append a timestamp so the punch gif always replays from its first frame
+      jerry.src = IMG.punch + "?t=" + now;
+      if (punchConnects()) advanceRightBar();
+    }
+
+    /* ============================ Main loop ============================ */
+    function frame(now){
+      if (!lastTime) lastTime = now;
+      var dt = (now - lastTime) / 1000;
+      lastTime = now;
+
+      if (!gameOver){
+        if (isPunching && now >= punchEndsAt) isPunching = false;
+
+        if (!isPunching){
+          var dir = (keys.right ? 1 : 0) - (keys.left ? 1 : 0);
+          if (dir !== 0){
+            jerryX += dir * MOVE_SPEED * dt;
+            var maxX = window.innerWidth - jerry.offsetWidth;
+            if (jerryX < 0) jerryX = 0;
+            if (jerryX > maxX) jerryX = maxX;
+            jerry.style.left = jerryX + "px";
+            setAnim(dir > 0 ? "walk" : "walkback");
+          } else {
+            setAnim("idle");
+          }
+        }
+      }
+      requestAnimationFrame(frame);
+    }
+
+    /* ============================== Input ============================== */
+    document.addEventListener("keydown", function(e){
+      var ours = (e.code === "ArrowRight" || e.code === "ArrowLeft" || e.code === "Space");
+      if (!ours) return;
+      e.preventDefault();
+      if (e.repeat) return;                              // ignore OS key-repeat
+      if (e.code === "ArrowRight") keys.right = true;
+      else if (e.code === "ArrowLeft") keys.left = true;
+      else if (e.code === "Space"){
+        if (!gameOver && !isPunching) startPunch(performance.now());
+      }
+    });
+
+    document.addEventListener("keyup", function(e){
+      if (e.code === "ArrowRight") keys.right = false;
+      else if (e.code === "ArrowLeft") keys.left = false;
+    });
+
+    // Drop held keys if the window loses focus (prevents "stuck walking")
+    window.addEventListener("blur", function(){ keys.left = keys.right = false; });
+
+    /* ============================== Start ============================== */
+    window.addEventListener("load", function(){
+      initBars();
+      jerry.style.left = "0px";
+      requestAnimationFrame(frame);
+    });
+  })();
+  </script>
+</body>
+</html>
